@@ -1,0 +1,26 @@
+{
+  "name": "deepseek-to-openai-api",
+  "version": "1.0.0",
+  "description": "Convert DeepSeek web chat to OpenAI-compatible API service",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "test": "jest",
+    "test:verbose": "jest --verbose",
+    "test:coverage": "jest --coverage",
+    "cli": "node test-cli.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.7",
+    "dotenv": "^16.4.1",
+    "eventsource-parser": "^1.1.2",
+    "express": "^4.18.2",
+    "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "nock": "^13.5.0",
+    "supertest": "^6.3.3"
+  }
+}
