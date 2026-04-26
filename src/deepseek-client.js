@@ -179,6 +179,10 @@ class DeepSeekClient {
       .replace(/<environment_details>[\s\S]*?<\/environment_details>/g, '')
       // Strip **Calling:** `toolName` + code block (hallucinated markdown format)
       .replace(/\*\*Calling:\*\*\s+`[a-z_]\w*`\s*\n```(?:\w*)?\n?[\s\S]*?(?:\n```|$)/g, '')
+      // Strip <invoke name="...">...</invoke> (Anthropic legacy XML format)
+      .replace(/<invoke\s+name="[^"]*">[\s\S]*?(?:<\/invoke>|$)/g, '')
+      .replace(/<invoke\s[^>]*>/g, '')
+      .replace(/<\/invoke>/g, '')
       .trim();
   }
 
@@ -349,6 +353,41 @@ class DeepSeekClient {
       if (json && Array.isArray(json)) {
         const res = normalize(json, tagMatch[0]);
         if (res) return res;
+      }
+    }
+
+    // 1c-i. Anthropic legacy <invoke> format (hallucinated when Kilo's system prompt leaks in)
+    // <invoke name="bash">\n<parameter name="command" string="true">git pull</parameter>\n</invoke>
+    const invokeTagRegex = /<invoke\s+name="([^"]+)">([\s\S]*?)(?:<\/invoke>|$)/g;
+    const invokeMatches = [...content.matchAll(invokeTagRegex)];
+    if (invokeMatches.length > 0) {
+      const tool_calls = [];
+      let cleanedContent = content;
+      for (let i = 0; i < invokeMatches.length; i++) {
+        cleanedContent = cleanedContent.replace(invokeMatches[i][0], '').trim();
+        const name = invokeMatches[i][1];
+        const paramsInner = invokeMatches[i][2];
+        const args = {};
+        const paramRegex = /<parameter\s+name="([^"]+)"[^>]*>([\s\S]*?)(?:<\/parameter>|$)/g;
+        const paramMatches = [...paramsInner.matchAll(paramRegex)];
+        for (const pMatch of paramMatches) {
+          args[pMatch[1]] = pMatch[2].trim();
+        }
+        let argumentsObj = args;
+        if (paramMatches.length === 0 && paramsInner.trim().startsWith('{')) {
+          const parsed = tryParseJSON(paramsInner.trim());
+          if (parsed) argumentsObj = parsed;
+        }
+        tool_calls.push({
+          id: `call_${uuidv4().split('-')[0]}${i}`,
+          type: 'function',
+          function: { name, arguments: JSON.stringify(argumentsObj) },
+          index: i
+        });
+      }
+      if (tool_calls.length > 0) {
+        cleanedContent = cleanedContent.replace(/<environment_details>[\s\S]*?<\/environment_details>/, '').trim();
+        return { content: cleanedContent, tool_calls };
       }
     }
 
@@ -1013,6 +1052,7 @@ class DeepSeekClient {
           const TARGETS = [
             '<tool_calls>',
             '<tool_call',
+            '<invoke ',
             '**Calling:**',
             '```json\n[',
             '\n[{"',
