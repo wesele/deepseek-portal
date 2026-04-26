@@ -183,6 +183,10 @@ class DeepSeekClient {
       .replace(/<invoke\s+name="[^"]*">[\s\S]*?(?:<\/invoke>|$)/g, '')
       .replace(/<invoke\s[^>]*>/g, '')
       .replace(/<\/invoke>/g, '')
+      // Strip <toolcall>/<tool_call_id> sub-tags (mixed XML hallucination)
+      .replace(/<toolcall>[\s\S]*?(?:<\/toolcall>|$)/g, '')
+      .replace(/<\/?toolcall>/g, '')
+      .replace(/<tool_call_id>[^<]*<\/tool_call_id>/g, '')
       .trim();
   }
 
@@ -436,6 +440,40 @@ class DeepSeekClient {
         return { content: cleanedContent, tool_calls };
       }
     }
+    // 1b-ii. <tool_call><tool_call_id>toolName</tool_call_id><toolcall><parameter>…</parameter></toolcall>
+    // Model uses <tool_call_id> to hold the TOOL NAME, and nests params in a <toolcall> element.
+    // e.g.: <tool_call>\n<tool_call_id>read_file</tool_call_id>\n<toolcall>\n<parameter name="filePath">C:/…</parameter>\n</toolcall>
+    const mixedXmlRegex = /<tool_call>\s*<tool_call_id>([^<]+)<\/tool_call_id>\s*<toolcall>([\s\S]*?)(?:<\/toolcall>|$)/g;
+    const mixedXmlMatches = [...content.matchAll(mixedXmlRegex)];
+    if (mixedXmlMatches.length > 0) {
+      const tool_calls = [];
+      let cleanedContent = content;
+      for (let i = 0; i < mixedXmlMatches.length; i++) {
+        // Remove the whole match plus any trailing </parameter> or </tool_call> scraps
+        cleanedContent = cleanedContent.replace(mixedXmlMatches[i][0], '').trim();
+        const name = mixedXmlMatches[i][1].trim();
+        const paramsInner = mixedXmlMatches[i][2];
+        const args = {};
+        const paramRegex = /<parameter\s+name="([^"]+)"[^>]*>([\s\S]*?)(?:<\/parameter>|$)/g;
+        const paramMatches = [...paramsInner.matchAll(paramRegex)];
+        for (const pMatch of paramMatches) {
+          const val = pMatch[2].trim();
+          // Coerce numeric strings to numbers so offset/line args work correctly
+          args[pMatch[1]] = /^\d+$/.test(val) ? Number(val) : val;
+        }
+        tool_calls.push({
+          id: `call_${uuidv4().split('-')[0]}${i}`,
+          type: 'function',
+          function: { name, arguments: JSON.stringify(args) },
+          index: i
+        });
+      }
+      if (tool_calls.length > 0) {
+        cleanedContent = cleanedContent.replace(/<\/parameter>/g, '').replace(/<\/tool_call>/g, '').trim();
+        return { content: cleanedContent, tool_calls };
+      }
+    }
+
     // 1b. <tool_call> with XML sub-tags (hallucinated in Chinese mode):
     // <tool_call><tool_call_id>call_x</tool_call_id><tool_call_name>fn</tool_call_name><tool_args>{}</tool_args></tool_call>
     const chineseXmlRegex = /<tool_call>\s*<tool_call_id>([^<]*)<\/tool_call_id>\s*<tool_call_name>([^<]+)<\/tool_call_name>\s*<tool_args>([\s\S]*?)<\/tool_args>\s*(?:<\/tool_call>|$)/g;
