@@ -211,24 +211,39 @@ class DeepSeekClient {
     }
     merged.push(current);
 
+    // Build bilingual tool instructions once, injected right after the system block
+    // so they are clearly pre-conversation directives, not mixed with user messages.
+    let toolBlock = '';
+    if (tools && tools.length > 0) {
+      const toolDefs = JSON.stringify(tools);
+      toolBlock = `\n\n# Tools / 工具调用\n\n` +
+        `You MUST call the appropriate tool(s) to complete every step of the task. ` +
+        `Do NOT answer with plain text when a tool call is needed.\n` +
+        `每个步骤都必须调用相应工具完成，不能在需要调用工具时直接用文字回答。\n\n` +
+        `Available tools (function signatures) / 可用工具（函数签名）:\n` +
+        `<tools>\n${toolDefs}\n</tools>\n\n` +
+        `For each function call, return a JSON object within <tool_call></tool_call> XML tags.\n` +
+        `每次调用工具，请在 <tool_call></tool_call> XML 标签内返回 JSON 对象：\n` +
+        `<tool_call>\n{"name": "function_name", "arguments": {"arg_name": "arg_value"}}\n</tool_call>`;
+    }
+
     let prompt = merged
       .map((block, index) => {
         if (block.role === 'assistant') {
           return `<｜Assistant｜>${block.text}<｜end of sentence｜>`;
         }
         if (block.role === 'user' || block.role === 'system') {
-          return index > 0 ? `<｜User｜>${block.text}` : block.text;
+          if (index === 0) {
+            // First block (system / opening): inject tool instructions here so they
+            // appear as system-level directives before any user turn.
+            return block.text + toolBlock;
+          }
+          return `<｜User｜>${block.text}`;
         }
         return block.text;
       })
       .join('')
       .replace(/!\[.+\]\(.+\)/g, '');
-
-    if (tools && tools.length > 0) {
-      const toolDefs = JSON.stringify(tools);
-      
-      prompt += `\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n${toolDefs}\n</tools>\n\nFor each function call, return a JSON object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{"name": "function_name", "arguments": {"arg_name": "arg_value"}}\n</tool_call>`;
-    }
 
     return prompt;
   }
@@ -359,6 +374,33 @@ class DeepSeekClient {
         return { content: cleanedContent, tool_calls };
       }
     }
+    // 1b. <tool_call> with XML sub-tags (hallucinated in Chinese mode):
+    // <tool_call><tool_call_id>call_x</tool_call_id><tool_call_name>fn</tool_call_name><tool_args>{}</tool_args></tool_call>
+    const chineseXmlRegex = /<tool_call>\s*<tool_call_id>([^<]*)<\/tool_call_id>\s*<tool_call_name>([^<]+)<\/tool_call_name>\s*<tool_args>([\s\S]*?)<\/tool_args>\s*(?:<\/tool_call>|$)/g;
+    const chineseXmlMatches = [...content.matchAll(chineseXmlRegex)];
+    if (chineseXmlMatches.length > 0) {
+      const tool_calls = [];
+      let cleanedContent = content;
+      for (let i = 0; i < chineseXmlMatches.length; i++) {
+        cleanedContent = cleanedContent.replace(chineseXmlMatches[i][0], '').trim();
+        const id = chineseXmlMatches[i][1].trim() || `call_${uuidv4().split('-')[0]}${i}`;
+        const name = chineseXmlMatches[i][2].trim();
+        const argsStr = chineseXmlMatches[i][3].trim();
+        let argsObj;
+        try { argsObj = JSON.parse(argsStr); } catch { argsObj = {}; }
+        tool_calls.push({
+          id,
+          type: 'function',
+          function: { name, arguments: JSON.stringify(argsObj) },
+          index: i
+        });
+      }
+      if (tool_calls.length > 0) {
+        return { content: cleanedContent, tool_calls };
+      }
+    }
+
+    // 1c. <tool_call>{"name":...}</tool_call> (our instructed JSON format)
     const nativeTagRegex = /<tool_call>\s*([\s\S]*?)(?:<\/tool_call>|$)/g;
     const nativeMatches = [...content.matchAll(nativeTagRegex)];
     if (nativeMatches.length > 0) {
@@ -373,7 +415,7 @@ class DeepSeekClient {
             type: json.type || 'function',
             function: {
               name: json.name || (json.function && json.function.name) || '',
-              arguments: json.arguments !== undefined ? 
+              arguments: json.arguments !== undefined ?
                 (typeof json.arguments === 'string' ? json.arguments : JSON.stringify(json.arguments)) :
                 (json.function && json.function.arguments !== undefined ?
                   (typeof json.function.arguments === 'string' ? json.function.arguments : JSON.stringify(json.function.arguments)) :
@@ -384,34 +426,8 @@ class DeepSeekClient {
         }
       }
       if (tool_calls.length > 0) {
+        cleanedContent = cleanedContent.replace(/<environment_details>[\s\S]*?<\/environment_details>/, '').trim();
         return { content: cleanedContent, tool_calls };
-      }
-    }
-
-    // 1b. <tool_call> ... </tool_call> (DeepSeek native format, can be multiple)
-    const nativeDsRegex = /<tool_call>\s*([\s\S]*?)(?:<\/tool_call>|$)/g;
-    const nativeDsMatches = [...content.matchAll(nativeDsRegex)];
-    if (nativeDsMatches.length > 0) {
-      // Check if it's Claude format which was matched above, if so skip this
-      if (!content.match(/<tool_call\s+name="/)) {
-        const tool_calls = [];
-        let cleanedContent = content;
-        for (let i = 0; i < nativeDsMatches.length; i++) {
-          cleanedContent = cleanedContent.replace(nativeDsMatches[i][0], '').trim();
-          const json = tryParseJSON(nativeDsMatches[i][1].trim());
-          if (json) {
-            tool_calls.push({
-              id: json.id || `call_${uuidv4().split('-')[0]}${i}`,
-              type: json.type || 'function',
-              function: json.function || { name: json.name, arguments: typeof json.arguments === 'string' ? json.arguments : JSON.stringify(json.arguments) },
-              index: i
-            });
-          }
-        }
-        if (tool_calls.length > 0) {
-          cleanedContent = cleanedContent.replace(/<environment_details>[\s\S]*?<\/environment_details>/, '').trim();
-          return { content: cleanedContent, tool_calls };
-        }
       }
     }
 
