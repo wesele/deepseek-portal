@@ -500,6 +500,42 @@ class DeepSeekClient {
       }
     }
 
+    // 1b-iii. <tool_call> with inner <tool_count name="..."> or <tool_call name="...">
+    // Model typos "count" instead of "call", outer tag has no name attribute:
+    //   <tool_call>\n<tool_count name="bash">\n<parameter name="description">cmd</parameter>\n</tool_count>
+    const nestedNamedXmlRegex = /<tool_call>\s*<tool_(?:call|count)\s+name="([^"]+)">([\s\S]*?)(?:<\/tool_(?:call|count)>|$)/g;
+    const nestedNamedXmlMatches = [...content.matchAll(nestedNamedXmlRegex)];
+    if (nestedNamedXmlMatches.length > 0) {
+      const tool_calls = [];
+      let cleanedContent = content;
+      for (let i = 0; i < nestedNamedXmlMatches.length; i++) {
+        cleanedContent = cleanedContent.replace(nestedNamedXmlMatches[i][0], '').trim();
+        const name = nestedNamedXmlMatches[i][1];
+        const paramsInner = nestedNamedXmlMatches[i][2];
+        const args = {};
+        const paramRegex = /<parameter\s+name="([^"]+)"[^>]*>([\s\S]*?)(?:<\/parameter>|$)/g;
+        const paramMatches = [...paramsInner.matchAll(paramRegex)];
+        for (const pMatch of paramMatches) {
+          args[pMatch[1]] = pMatch[2].trim();
+        }
+        let argumentsObj = args;
+        if (paramMatches.length === 0 && paramsInner.trim().startsWith('{')) {
+          const parsed = tryParseJSON(paramsInner.trim());
+          if (parsed) argumentsObj = parsed;
+        }
+        tool_calls.push({
+          id: `call_${uuidv4().split('-')[0]}${i}`,
+          type: 'function',
+          function: { name, arguments: JSON.stringify(argumentsObj) },
+          index: i
+        });
+      }
+      if (tool_calls.length > 0) {
+        cleanedContent = cleanedContent.replace(/<\/parameter>/g, '').replace(/<\/tool_call>/g, '').trim();
+        return { content: cleanedContent, tool_calls };
+      }
+    }
+
     // 1c. <tool_call>{"name":...}</tool_call> (our instructed JSON format)
     // Also handles two common model failures:
     //   • Missing opening {"  → model outputs: name":"edit","arg":"val"
