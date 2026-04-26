@@ -177,6 +177,8 @@ class DeepSeekClient {
       .replace(/<\/tool_call>/g, '')
       .replace(/<\/?parameter[^>]*>/g, '')
       .replace(/<environment_details>[\s\S]*?<\/environment_details>/g, '')
+      // Strip **Calling:** `toolName` + code block (hallucinated markdown format)
+      .replace(/\*\*Calling:\*\*\s+`[a-z_]\w*`\s*\n```(?:\w*)?\n?[\s\S]*?(?:\n```|$)/g, '')
       .trim();
   }
 
@@ -520,6 +522,37 @@ class DeepSeekClient {
             function: { name: m[1], arguments: JSON.stringify(json) },
             index: i
           });
+        }
+        if (tool_calls.length > 0) return { content: cleanedContent, tool_calls };
+      }
+    }
+
+    // 4c. **Calling:** `toolName` style with code block (hallucinated markdown format)
+    // e.g.:  **Calling:** `edit`
+    //        ```
+    //        {"filePath": "...", "oldString": "...", "newString": "..."}
+    //        ```
+    // The JSON is flat (no "name"/"arguments" wrapper); tool name comes from the markdown line.
+    {
+      const callingPattern = /\*\*Calling:\*\*\s+`([a-z_]\w*)`\s*\n```(?:\w*)?\n?([\s\S]*?)(?:\n```|$)/g;
+      const callingMatches = [...content.matchAll(callingPattern)];
+      if (callingMatches.length > 0) {
+        const tool_calls = [];
+        let cleanedContent = content;
+        for (let i = 0; i < callingMatches.length; i++) {
+          const m = callingMatches[i];
+          cleanedContent = cleanedContent.replace(m[0], '').trim();
+          const toolName = m[1];
+          const innerText = m[2].trim();
+          const json = tryParseJSON(innerText);
+          if (json && typeof json === 'object' && !Array.isArray(json)) {
+            tool_calls.push({
+              id: `call_${uuidv4().split('-')[0]}${i}`,
+              type: 'function',
+              function: { name: toolName, arguments: JSON.stringify(json) },
+              index: i
+            });
+          }
         }
         if (tool_calls.length > 0) return { content: cleanedContent, tool_calls };
       }
@@ -980,6 +1013,7 @@ class DeepSeekClient {
           const TARGETS = [
             '<tool_calls>',
             '<tool_call',
+            '**Calling:**',
             '```json\n[',
             '\n[{"',
             '[{"'
