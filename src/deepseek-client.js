@@ -1,10 +1,16 @@
 const axios = require('axios');
+const https = require('https');
 const { v4: uuidv4 } = require('uuid');
 const { createParser } = require('eventsource-parser');
 const { EventEmitter } = require('events');
 const { PassThrough } = require('stream');
 const path = require('path');
 const DeepSeekHash = require('./challenge');
+
+// Allow disabling SSL verification for corporate MITM proxies
+const httpsAgent = process.env.NODE_TLS_REJECT_UNAUTHORIZED === '0'
+  ? new https.Agent({ rejectUnauthorized: false })
+  : undefined;
 
 const WASM_PATH = path.join(__dirname, '..', 'sha3_wasm_bg.wasm');
 
@@ -76,7 +82,8 @@ class DeepSeekClient {
         ...FAKE_HEADERS
       },
       timeout: 15000,
-      validateStatus: () => true
+      validateStatus: () => true,
+      httpsAgent
     });
 
     if (!response.data || response.data.code !== 0) {
@@ -102,7 +109,8 @@ class DeepSeekClient {
           ...FAKE_HEADERS
         },
         timeout: 15000,
-        validateStatus: () => true
+        validateStatus: () => true,
+        httpsAgent
       }
     );
 
@@ -129,7 +137,8 @@ class DeepSeekClient {
           ...FAKE_HEADERS
         },
         timeout: 15000,
-        validateStatus: () => true
+        validateStatus: () => true,
+        httpsAgent
       }
     );
 
@@ -162,18 +171,17 @@ class DeepSeekClient {
       if (msg.role === 'tool') {
         const toolCallId = msg.tool_call_id || '';
         const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
-        return { role: 'user', text: `[Tool result (ID: ${toolCallId})]\n${content}` };
+        // Structured format so the model clearly recognises tool results and continues the agentic loop
+        return { role: 'user', text: `<tool_response>\n<tool_call_id>${toolCallId}</tool_call_id>\n<result>\n${content}\n</result>\n</tool_response>` };
       }
       if (msg.role === 'assistant' && msg.tool_calls) {
-        const cleanToolCalls = msg.tool_calls.map(tc => ({
-          id: tc.id,
-          type: tc.type || 'function',
-          function: {
-            name: tc.function.name,
-            arguments: typeof tc.function.arguments === 'string' ? tc.function.arguments : JSON.stringify(tc.function.arguments)
-          }
-        }));
-        const toolCallsText = `<tool_calls>\n${JSON.stringify(cleanToolCalls)}\n</tool_calls>`;
+        // Use the same <tool_call> format as the instruction so the model learns the pattern consistently
+        const toolCallsText = msg.tool_calls.map(tc => {
+          const argsStr = typeof tc.function.arguments === 'string' ? tc.function.arguments : JSON.stringify(tc.function.arguments);
+          let argsObj;
+          try { argsObj = JSON.parse(argsStr); } catch { argsObj = argsStr; }
+          return `<tool_call>\n${JSON.stringify({ name: tc.function.name, arguments: argsObj })}\n</tool_call>`;
+        }).join('\n');
         const baseText = msg.content ? String(msg.content) : '';
         const cleanedBaseText = this.parseToolCalls(baseText).content;
         return { role: msg.role, text: cleanedBaseText ? `${cleanedBaseText}\n${toolCallsText}` : toolCallsText };
@@ -528,6 +536,18 @@ class DeepSeekClient {
     const { modelType, thinkingEnabled, searchEnabled } = this.parseModelOptions(model);
     const prompt = this.prepareMessages(messages, tools, toolChoice);
     const estimatedPromptTokens = this.estimateTokens(prompt);
+
+    if (process.env.DEBUG === '1') {
+      console.log('\n[DBG] ── PROMPT SENT TO DEEPSEEK (' + prompt.length + ' chars) ──────────────');
+      // Print in sections to stay readable
+      const SECTION = 1200;
+      for (let i = 0; i < prompt.length; i += SECTION) {
+        console.log(prompt.slice(i, i + SECTION));
+        if (i + SECTION < prompt.length) console.log('... [continues] ...');
+      }
+      console.log('[DBG] ── END PROMPT ──────────────────────────────────────────');
+    }
+
     const [refSessionId, refParentMsgId] = refConvId?.split('@') || [];
 
     const sessionId = refSessionId || await this.createSession();
@@ -558,7 +578,8 @@ class DeepSeekClient {
         },
         timeout: 120000,
         validateStatus: () => true,
-        responseType: 'stream'
+        responseType: 'stream',
+        httpsAgent
       }
     );
 
@@ -665,15 +686,26 @@ class DeepSeekClient {
         const parsed = this.parseToolCalls(accumulatedContent.trim());
         const message = {
           role: 'assistant',
-          content: parsed.content,
+          content: parsed.tool_calls ? null : parsed.content,
           reasoning_content: accumulatedThinking.trim() || undefined
         };
         if (parsed.tool_calls) {
-          message.tool_calls = parsed.tool_calls;
+          // Strip internal `index` field — not part of OpenAI non-streaming spec
+          message.tool_calls = parsed.tool_calls.map(({ index: _idx, ...tc }) => tc);
         }
         
         const completionTokens = accumulatedTokenUsage || this.estimateTokens(accumulatedContent + accumulatedThinking);
-        
+        const finishReason = parsed.tool_calls ? 'tool_calls' : 'stop';
+
+        if (process.env.DEBUG === '1') {
+          console.log('\n[DBG] ── RESPONSE (non-stream) ──────────────────────────────');
+          console.log(`[DBG] finish_reason : ${finishReason}`);
+          console.log(`[DBG] content       : ${(parsed.content || '').slice(0, 300).replace(/\n/g, '↵')}`);
+          console.log(`[DBG] tool_calls    : ${parsed.tool_calls ? JSON.stringify(parsed.tool_calls) : 'none'}`);
+          console.log(`[DBG] raw content   : ${accumulatedContent.slice(0, 500).replace(/\n/g, '↵')}`);
+          console.log('[DBG] ─────────────────────────────────────────────────────────');
+        }
+
         resolve({
           id: `${sessionId}@${messageId}`,
           model,
@@ -681,7 +713,7 @@ class DeepSeekClient {
           choices: [{
             index: 0,
             message,
-            finish_reason: parsed.tool_calls ? 'tool_calls' : 'stop'
+            finish_reason: finishReason
           }],
           usage: {
             prompt_tokens: promptTokens,
@@ -716,11 +748,22 @@ class DeepSeekClient {
         completion_tokens: completionTokens,
         total_tokens: promptTokens + completionTokens
       };
-      
+      const baseId = `${sessionId}@${messageId}`;
+
+      if (process.env.DEBUG === '1') {
+        const finishReason = parsed.tool_calls ? 'tool_calls' : 'stop';
+        console.log('\n[DBG] ── RESPONSE (stream final) ────────────────────────────');
+        console.log(`[DBG] finish_reason : ${finishReason}`);
+        console.log(`[DBG] content       : ${(parsed.content || '').slice(0, 300).replace(/\n/g, '↵')}`);
+        console.log(`[DBG] tool_calls    : ${parsed.tool_calls ? JSON.stringify(parsed.tool_calls) : 'none'}`);
+        console.log(`[DBG] raw content   : ${accumulatedContent.slice(0, 500).replace(/\n/g, '↵')}`);
+        console.log('[DBG] ─────────────────────────────────────────────────────────');
+      }
+
       const remainingContent = parsed.content.substring(streamedContentLength);
       if (remainingContent) {
         passthrough.write(`data: ${JSON.stringify({
-          id: `${sessionId}@${messageId}`,
+          id: baseId,
           model,
           object: 'chat.completion.chunk',
           choices: [{ index: 0, delta: { content: remainingContent }, finish_reason: null }],
@@ -728,20 +771,33 @@ class DeepSeekClient {
         })}\n\n`);
       }
 
-      const choices = [{
-        index: 0,
-        delta: parsed.tool_calls ? { tool_calls: parsed.tool_calls } : {},
-        finish_reason: parsed.tool_calls ? 'tool_calls' : 'stop'
-      }];
-
-      passthrough.write(`data: ${JSON.stringify({
-        id: `${sessionId}@${messageId}`,
-        model,
-        object: 'chat.completion.chunk',
-        choices,
-        usage,
-        created
-      })}\n\n`);
+      if (parsed.tool_calls && parsed.tool_calls.length > 0) {
+        // Stream tool calls in OpenAI format: header chunk → arguments chunk per call → finish chunk
+        for (const tc of parsed.tool_calls) {
+          const tcIndex = tc.index !== undefined ? tc.index : 0;
+          passthrough.write(`data: ${JSON.stringify({
+            id: baseId, model, object: 'chat.completion.chunk', created,
+            choices: [{ index: 0, delta: { tool_calls: [{ index: tcIndex, id: tc.id, type: tc.type || 'function', function: { name: tc.function.name, arguments: '' } }] }, finish_reason: null }]
+          })}\n\n`);
+          if (tc.function.arguments) {
+            passthrough.write(`data: ${JSON.stringify({
+              id: baseId, model, object: 'chat.completion.chunk', created,
+              choices: [{ index: 0, delta: { tool_calls: [{ index: tcIndex, function: { arguments: tc.function.arguments } }] }, finish_reason: null }]
+            })}\n\n`);
+          }
+        }
+        passthrough.write(`data: ${JSON.stringify({
+          id: baseId, model, object: 'chat.completion.chunk', created,
+          choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
+          usage
+        })}\n\n`);
+      } else {
+        passthrough.write(`data: ${JSON.stringify({
+          id: baseId, model, object: 'chat.completion.chunk', created,
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+          usage
+        })}\n\n`);
+      }
 
       passthrough.end('data: [DONE]\n\n');
     };

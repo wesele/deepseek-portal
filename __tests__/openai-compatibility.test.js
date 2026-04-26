@@ -850,10 +850,11 @@ describe('OpenAI API Compatibility Tests', () => {
         });
 
       expect(response.status).toBe(200);
-      expect(response.body.choices[0].message.content).toBe('');
+      expect(response.body.choices[0].message.content).toBeNull();
       expect(response.body.choices[0].message.tool_calls).toBeDefined();
       expect(response.body.choices[0].message.tool_calls).toHaveLength(1);
       expect(response.body.choices[0].message.tool_calls[0].function.name).toBe('get_weather');
+      expect(response.body.choices[0].message.tool_calls[0]).not.toHaveProperty('index');
       expect(response.body.choices[0].finish_reason).toBe('tool_calls');
     });
 

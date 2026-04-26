@@ -56,8 +56,20 @@ app.get('/v1/models', (req, res) => {
   });
 });
 
+const DBG = process.env.DEBUG === '1';
+const reqCounter = { n: 0 };
+
+function dbg(...args) {
+  if (DBG) console.log('[DBG]', ...args);
+}
+
+function dbgSection(title) {
+  if (DBG) console.log(`\n${'─'.repeat(60)}\n[DBG] ${title}\n${'─'.repeat(60)}`);
+}
+
 // Chat completions endpoint
 app.post('/v1/chat/completions', async (req, res) => {
+  const reqId = ++reqCounter.n;
   try {
     const authHeader = req.headers.authorization;
     let token;
@@ -82,6 +94,19 @@ app.post('/v1/chat/completions', async (req, res) => {
     const tools = body.tools;
     const toolChoice = body.tool_choice;
 
+    if (DBG) {
+      dbgSection(`REQUEST #${reqId}  model=${model}  stream=${stream}`);
+      dbg(`tool_choice=${JSON.stringify(toolChoice)}  tools=${tools?.length ?? 0}`);
+      body.messages.forEach((m, i) => {
+        const preview = Array.isArray(m.content)
+          ? '[array content]'
+          : String(m.content ?? '').slice(0, 120).replace(/\n/g, '↵');
+        const tc = m.tool_calls ? `  tool_calls(${m.tool_calls.length})` : '';
+        const tid = m.tool_call_id ? `  tool_call_id=${m.tool_call_id}` : '';
+        dbg(`  msg[${i}] role=${m.role}${tc}${tid}: ${preview}`);
+      });
+    }
+
     const client = new DeepSeekClient(token);
 
     if (stream) {
@@ -97,7 +122,6 @@ app.post('/v1/chat/completions', async (req, res) => {
       });
 
       stream.on('end', () => {
-        res.write('data: [DONE]\n\n');
         res.end();
       });
 
