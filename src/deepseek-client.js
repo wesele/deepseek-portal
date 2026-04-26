@@ -166,6 +166,20 @@ class DeepSeekClient {
     })).toString('base64');
   }
 
+  _stripToolArtifacts(text) {
+    if (!text) return text || '';
+    return text
+      .replace(/<tool_calls>[\s\S]*?<\/tool_calls>/g, '')
+      .replace(/<tool_calls>/g, '')
+      .replace(/<\/tool_calls>/g, '')
+      .replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '')
+      .replace(/<tool_call>/g, '')
+      .replace(/<\/tool_call>/g, '')
+      .replace(/<\/?parameter[^>]*>/g, '')
+      .replace(/<environment_details>[\s\S]*?<\/environment_details>/g, '')
+      .trim();
+  }
+
   prepareMessages(messages, tools, toolChoice) {
     const processed = messages.map(msg => {
       if (msg.role === 'tool') {
@@ -183,7 +197,7 @@ class DeepSeekClient {
           return `<tool_call>\n${JSON.stringify({ name: tc.function.name, arguments: argsObj })}\n</tool_call>`;
         }).join('\n');
         const baseText = msg.content ? String(msg.content) : '';
-        const cleanedBaseText = this.parseToolCalls(baseText).content;
+        const cleanedBaseText = this._stripToolArtifacts(this.parseToolCalls(baseText).content);
         return { role: msg.role, text: cleanedBaseText ? `${cleanedBaseText}\n${toolCallsText}` : toolCallsText };
       }
       let text;
@@ -191,6 +205,10 @@ class DeepSeekClient {
         text = msg.content.filter(item => item.type === 'text').map(item => item.text).join('\n');
       } else {
         text = String(msg.content || '');
+      }
+      // Strip tool-call XML artifacts from assistant history (guards against poisoned context)
+      if (msg.role === 'assistant') {
+        text = this._stripToolArtifacts(text);
       }
       return { role: msg.role, text };
     });
@@ -734,6 +752,7 @@ class DeepSeekClient {
           return;
         }
         const parsed = this.parseToolCalls(accumulatedContent.trim());
+        parsed.content = this._stripToolArtifacts(parsed.content);
         const message = {
           role: 'assistant',
           content: parsed.tool_calls ? null : parsed.content,
@@ -792,6 +811,7 @@ class DeepSeekClient {
 
     const sendFinalChunks = () => {
       const parsed = this.parseToolCalls(accumulatedContent);
+      parsed.content = this._stripToolArtifacts(parsed.content);
       const completionTokens = accumulatedTokenUsage || this.estimateTokens(accumulatedContent + accumulatedThinking);
       const usage = {
         prompt_tokens: promptTokens,
