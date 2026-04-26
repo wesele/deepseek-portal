@@ -216,15 +216,18 @@ class DeepSeekClient {
     let toolBlock = '';
     if (tools && tools.length > 0) {
       const toolDefs = JSON.stringify(tools);
-      toolBlock = `\n\n# Tools / 工具调用\n\n` +
-        `You MUST call the appropriate tool(s) to complete every step of the task. ` +
-        `Do NOT answer with plain text when a tool call is needed.\n` +
-        `每个步骤都必须调用相应工具完成，不能在需要调用工具时直接用文字回答。\n\n` +
-        `Available tools (function signatures) / 可用工具（函数签名）:\n` +
-        `<tools>\n${toolDefs}\n</tools>\n\n` +
-        `For each function call, return a JSON object within <tool_call></tool_call> XML tags.\n` +
-        `每次调用工具，请在 <tool_call></tool_call> XML 标签内返回 JSON 对象：\n` +
-        `<tool_call>\n{"name": "function_name", "arguments": {"arg_name": "arg_value"}}\n</tool_call>`;
+      toolBlock = `\n\n# Tools / 工具调用规则\n\n` +
+        `RULE 1: You MUST use the <tool_call> XML format for EVERY tool invocation. ` +
+        `NEVER describe what you are going to do in plain text — execute it immediately with the format.\n` +
+        `规则1：每次调用工具必须立即使用 <tool_call> XML 格式，绝不能用文字描述"我将要..."或"让我..."，要直接执行。\n\n` +
+        `RULE 2: If file content ends with a truncation notice, call the tool again immediately. ` +
+        `Do NOT write "I notice the file was truncated" — just call read_file again.\n` +
+        `规则2：如果文件内容末尾显示截断，立即再次调用工具，不要写"我注意到截断了"之类的文字。\n\n` +
+        `Available tools / 可用工具:\n<tools>\n${toolDefs}\n</tools>\n\n` +
+        `Tool call format / 工具调用格式（唯一合法格式）:\n` +
+        `<tool_call>\n{"name": "tool_name", "arguments": {"arg": "value"}}\n</tool_call>\n\n` +
+        `Example — correct response when a file is truncated / 截断时的正确示范:\n` +
+        `<tool_call>\n{"name": "read_file", "arguments": {"path": "src/example.js"}}\n</tool_call>`;
     }
 
     let prompt = merged
@@ -459,7 +462,38 @@ class DeepSeekClient {
       }
     }
 
-    // 4. Fallback: Robust regex extraction for truncated or malformed JSON
+    // 4a. Function-call style: toolName({"key": "val"}) — hallucinated in some Chinese-mode responses.
+    // e.g.  bash({"command": "ls"})  read({"filePath": "src/index.js"})
+    // Guards: lowercase name, valid JSON object arg, not inside a ``` code block.
+    {
+      const fnCallPattern = /\b([a-z_]\w*)\s*\(\s*(\{[\s\S]*?\})\s*\)/g;
+      const fnMatches = [...content.matchAll(fnCallPattern)];
+      const validFnMatches = fnMatches.filter(m => {
+        const json = tryParseJSON(m[2]);
+        if (!json || typeof json !== 'object' || Array.isArray(json)) return false;
+        // Reject if the match sits inside a fenced code block
+        const before = content.substring(0, m.index);
+        return (before.match(/```/g) || []).length % 2 === 0;
+      });
+      if (validFnMatches.length > 0) {
+        const tool_calls = [];
+        let cleanedContent = content;
+        for (let i = 0; i < validFnMatches.length; i++) {
+          const m = validFnMatches[i];
+          const json = tryParseJSON(m[2]);
+          cleanedContent = cleanedContent.replace(m[0], '').trim();
+          tool_calls.push({
+            id: `call_${uuidv4().split('-')[0]}${i}`,
+            type: 'function',
+            function: { name: m[1], arguments: JSON.stringify(json) },
+            index: i
+          });
+        }
+        if (tool_calls.length > 0) return { content: cleanedContent, tool_calls };
+      }
+    }
+
+    // 4b. Fallback: Robust regex extraction for truncated or malformed JSON
     const tcRegex = /\{\s*(?:"id"\s*:\s*"([^"]+)"\s*,\s*)?(?:"type"\s*:\s*"([^"]+)"\s*,\s*)?(?:"function"\s*:\s*\{\s*)?"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*([\s\S]*?)(?=\},\s*\{\s*(?:"id"|"type"|"function"|"name")|\}\]|<\/tool_calls>|<\/tool_call>|```|$)/g;
     const fallbackMatches = [...content.matchAll(tcRegex)];
     if (fallbackMatches.length > 0) {
