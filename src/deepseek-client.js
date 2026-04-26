@@ -823,14 +823,15 @@ class DeepSeekClient {
       throw new Error(`API error (${contentType}): ${errorBody.substring(0, 300)}`);
     }
 
+    const contCtx = { modelType, thinkingEnabled, searchEnabled };
     if (stream) {
-      return this._convertToOpenAIStream(response.data, sessionId, model, estimatedPromptTokens);
+      return this._convertToOpenAIStream(response.data, sessionId, model, estimatedPromptTokens, contCtx);
     } else {
-      return this._collectStreamResponse(response.data, sessionId, model, estimatedPromptTokens);
+      return this._collectStreamResponse(response.data, sessionId, model, estimatedPromptTokens, contCtx);
     }
   }
 
-  async _collectStreamResponse(stream, sessionId, model, promptTokens) {
+  async _collectStreamResponse(stream, sessionId, model, promptTokens, contCtx = null) {
     let accumulatedContent = '';
     let accumulatedThinking = '';
     let messageId = '';
@@ -906,11 +907,25 @@ class DeepSeekClient {
 
       stream.on('data', (buffer) => parser.feed(buffer.toString()));
       stream.on('error', reject);
-      stream.on('close', () => {
+      stream.on('close', async () => {
         if (streamError) {
           reject(streamError);
           return;
         }
+
+        const MAX_CONTINUATION = 5;
+        for (let i = 0; i < MAX_CONTINUATION && this._isToolCallTruncated(accumulatedContent); i++) {
+          console.log(`[AutoContinue] Tool call truncated, fetching continuation ${i + 1}/${MAX_CONTINUATION}...`);
+          try {
+            const cont = await this._fetchContinuationContent(sessionId, messageId, contCtx);
+            accumulatedContent += cont.content;
+            if (cont.messageId) messageId = cont.messageId;
+          } catch (err) {
+            console.error('[AutoContinue] Continuation failed:', err.message);
+            break;
+          }
+        }
+
         const parsed = this.parseToolCalls(accumulatedContent.trim());
         parsed.content = this._stripToolArtifacts(parsed.content);
         const message = {
@@ -955,7 +970,87 @@ class DeepSeekClient {
     });
   }
 
-  _convertToOpenAIStream(stream, sessionId, model, promptTokens) {
+  _isToolCallTruncated(content) {
+    const tcOpens = (content.match(/<tool_call[\s>]/g) || []).length;
+    const tcCloses = (content.match(/<\/tool_call>/g) || []).length;
+    if (tcOpens > tcCloses) return true;
+    const invOpens = (content.match(/<invoke\s/g) || []).length;
+    const invCloses = (content.match(/<\/invoke>/g) || []).length;
+    if (invOpens > invCloses) return true;
+    return false;
+  }
+
+  async _fetchContinuationContent(sessionId, lastMessageId, contCtx) {
+    const { modelType, thinkingEnabled, searchEnabled } = contCtx;
+    const token = await this.acquireToken();
+    const challenge = await this.getChallengeResponse('/api/v0/chat/completion');
+    const powResponse = await this.answerChallenge(challenge, '/api/v0/chat/completion');
+
+    const response = await axios.post(
+      'https://chat.deepseek.com/api/v0/chat/completion',
+      {
+        chat_session_id: sessionId,
+        parent_message_id: lastMessageId ? Number(lastMessageId) : null,
+        model_type: modelType,
+        prompt: 'continue',
+        ref_file_ids: [],
+        thinking_enabled: thinkingEnabled,
+        search_enabled: searchEnabled,
+        preempt: false
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          ...FAKE_HEADERS,
+          Cookie: this.generateCookie(),
+          'X-Ds-Pow-Response': powResponse
+        },
+        timeout: 120000,
+        validateStatus: () => true,
+        responseType: 'stream',
+        httpsAgent
+      }
+    );
+
+    return new Promise((resolve, reject) => {
+      let content = '';
+      let newMessageId = '';
+      let currentPath = 'content';
+
+      const parser = createParser((event) => {
+        if (!event.data || event.event === 'hint') return;
+        if (event.data === '[DONE]') return;
+        try {
+          const chunk = JSON.parse(event.data);
+          if (!chunk || typeof chunk !== 'object') return;
+          if (chunk.response_message_id && !newMessageId) newMessageId = chunk.response_message_id;
+          if (chunk.v && chunk.v.response) {
+            currentPath = chunk.v.response.thinking_enabled ? 'thinking' : 'content';
+            if (chunk.v.response.fragments) {
+              chunk.v.response.fragments.forEach(f => { if (currentPath === 'content') content += (f.content || ''); });
+            }
+          } else if (chunk.p && chunk.p.startsWith('response/fragments')) {
+            currentPath = 'content';
+          }
+          if (typeof chunk.v === 'string' && currentPath === 'content') {
+            content += chunk.v.replace(/FINISHED/g, '');
+          } else if (Array.isArray(chunk.v)) {
+            chunk.v.forEach(e => {
+              if (Array.isArray(e.v) && currentPath === 'content') {
+                content += e.v.map(v => v.content || '').join('');
+              }
+            });
+          }
+        } catch (e) {}
+      });
+
+      response.data.on('data', (buf) => parser.feed(buf.toString()));
+      response.data.on('error', reject);
+      response.data.on('close', () => resolve({ content, messageId: newMessageId }));
+    });
+  }
+
+  _convertToOpenAIStream(stream, sessionId, model, promptTokens, contCtx = null) {
     const passthrough = new PassThrough();
     let messageId = '';
     let currentPath = 'content';
@@ -969,7 +1064,20 @@ class DeepSeekClient {
     let inToolCallBlock = false;
     let streamedContentLength = 0;
 
-    const sendFinalChunks = () => {
+    const sendFinalChunks = async () => {
+      const MAX_CONTINUATION = 5;
+      for (let i = 0; i < MAX_CONTINUATION && this._isToolCallTruncated(accumulatedContent); i++) {
+        console.log(`[AutoContinue] Tool call truncated, fetching continuation ${i + 1}/${MAX_CONTINUATION}...`);
+        try {
+          const cont = await this._fetchContinuationContent(sessionId, messageId, contCtx);
+          accumulatedContent += cont.content;
+          if (cont.messageId) messageId = cont.messageId;
+        } catch (err) {
+          console.error('[AutoContinue] Continuation failed:', err.message);
+          break;
+        }
+      }
+
       const parsed = this.parseToolCalls(accumulatedContent);
       parsed.content = this._stripToolArtifacts(parsed.content);
       const completionTokens = accumulatedTokenUsage || this.estimateTokens(accumulatedContent + accumulatedThinking);
