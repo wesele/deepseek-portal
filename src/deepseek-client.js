@@ -422,6 +422,9 @@ class DeepSeekClient {
     }
 
     // 1c. <tool_call>{"name":...}</tool_call> (our instructed JSON format)
+    // Also handles two common model failures:
+    //   • Missing opening {"  → model outputs: name":"edit","arg":"val"
+    //   • Flat args format  → {"name":"edit","filePath":"..."}  (no "arguments" wrapper)
     const nativeTagRegex = /<tool_call>\s*([\s\S]*?)(?:<\/tool_call>|$)/g;
     const nativeMatches = [...content.matchAll(nativeTagRegex)];
     if (nativeMatches.length > 0) {
@@ -429,19 +432,30 @@ class DeepSeekClient {
       let cleanedContent = content;
       for (let i = 0; i < nativeMatches.length; i++) {
         cleanedContent = cleanedContent.replace(nativeMatches[i][0], '').trim();
-        const json = tryParseJSON(nativeMatches[i][1].trim());
+        const innerText = nativeMatches[i][1].trim();
+        // Try as-is, then with missing opening brace+quote prepended
+        let json = tryParseJSON(innerText);
+        if (!json && !innerText.startsWith('{') && !innerText.startsWith('[')) {
+          json = tryParseJSON('{"' + innerText);
+        }
         if (json) {
+          const name = json.name || (json.function && json.function.name) || '';
+          let argsStr;
+          if (json.arguments !== undefined) {
+            argsStr = typeof json.arguments === 'string' ? json.arguments : JSON.stringify(json.arguments);
+          } else if (json.function?.arguments !== undefined) {
+            argsStr = typeof json.function.arguments === 'string' ? json.function.arguments : JSON.stringify(json.function.arguments);
+          } else if (name) {
+            // Flat format: {"name":"tool","arg1":...} — treat remaining keys as arguments
+            const { name: _n, id: _id, type: _t, function: _fn, index: _idx, ...args } = json;
+            argsStr = Object.keys(args).length > 0 ? JSON.stringify(args) : '{}';
+          } else {
+            argsStr = '{}';
+          }
           tool_calls.push({
             id: json.id || `call_${uuidv4().split('-')[0]}${i}`,
             type: json.type || 'function',
-            function: {
-              name: json.name || (json.function && json.function.name) || '',
-              arguments: json.arguments !== undefined ?
-                (typeof json.arguments === 'string' ? json.arguments : JSON.stringify(json.arguments)) :
-                (json.function && json.function.arguments !== undefined ?
-                  (typeof json.function.arguments === 'string' ? json.function.arguments : JSON.stringify(json.function.arguments)) :
-                  '{}')
-            },
+            function: { name, arguments: argsStr },
             index: i
           });
         }
