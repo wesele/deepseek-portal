@@ -877,7 +877,23 @@ class DeepSeekClient {
               }
             }
           } else if (chunk.p && chunk.p.startsWith('response/fragments')) {
-            currentPath = 'content';
+            // Check fragment type to determine thinking vs content
+            // when a new fragment is created (APPEND with array).
+            // response/fragments/-1/content chunks should NOT reset currentPath.
+            if (chunk.o === 'APPEND' && Array.isArray(chunk.v) && chunk.v.length > 0) {
+              const fragType = chunk.v[0].type;
+              if (fragType === 'THINK') {
+                currentPath = 'thinking';
+              } else if (fragType === 'RESPONSE') {
+                currentPath = 'content';
+              }
+              // Process initial fragment content
+              if (currentPath === 'thinking') {
+                chunk.v.forEach(f => { if (f.content) accumulatedThinking += f.content; });
+              } else if (currentPath === 'content') {
+                chunk.v.forEach(f => { if (f.content) accumulatedContent += f.content; });
+              }
+            }
           }
 
           if (typeof chunk.v === 'string') {
@@ -1030,7 +1046,18 @@ class DeepSeekClient {
               chunk.v.response.fragments.forEach(f => { if (currentPath === 'content') content += (f.content || ''); });
             }
           } else if (chunk.p && chunk.p.startsWith('response/fragments')) {
-            currentPath = 'content';
+            if (chunk.o === 'APPEND' && Array.isArray(chunk.v) && chunk.v.length > 0) {
+              const fragType = chunk.v[0].type;
+              if (fragType === 'THINK') {
+                currentPath = 'thinking';
+              } else if (fragType === 'RESPONSE') {
+                currentPath = 'content';
+              }
+              // Process initial fragment content
+              if (currentPath === 'content') {
+                chunk.v.forEach(f => { if (f.content) content += f.content; });
+              }
+            }
           }
           if (typeof chunk.v === 'string' && currentPath === 'content') {
             content += chunk.v.replace(/FINISHED/g, '');
@@ -1188,7 +1215,25 @@ class DeepSeekClient {
       if (chunk.v && chunk.v.response) {
         currentPath = chunk.v.response.thinking_enabled ? 'thinking' : 'content';
       } else if (chunk.p && chunk.p.startsWith('response/fragments')) {
-        currentPath = 'content';
+        if (chunk.o === 'APPEND' && Array.isArray(chunk.v) && chunk.v.length > 0) {
+          const fragType = chunk.v[0].type;
+          if (fragType === 'THINK') {
+            currentPath = 'thinking';
+          } else if (fragType === 'RESPONSE') {
+            currentPath = 'content';
+          }
+          // Process initial fragment content in streaming path
+          const fragContent = chunk.v.map(f => f.content || '').join('');
+          if (fragContent) {
+            if (currentPath === 'thinking') {
+              delta.reasoning_content = fragContent;
+              accumulatedThinking += fragContent;
+              isFirstChunk = false;
+            }
+            // RESPONSE fragment content in streaming will be picked up by
+            // the content extraction below via the Array.isArray path
+          }
+        }
       } else if (chunk.p === 'response/search_status' || chunk.p === 'response/search_results') {
         return;
       }
